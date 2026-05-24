@@ -2,6 +2,8 @@
 
 BrasaPlayer is a small GTK 4 media player intended for GNOME on Wayland. It uses the GTK 4 native media API.
 
+![](brasaplayer.png)
+
 ## controls
 
 - `h`: show shortcut help overlay
