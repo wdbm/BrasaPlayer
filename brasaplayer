@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+
+"""
+################################################################################
+#                                                                              #
+# BrasaPlayer                                                                  #
+#                                                                              #
+################################################################################
+#                                                                              #
+# LICENCE INFORMATION                                                          #
+#                                                                              #
+# This program is an media player.                                             #
+#                                                                              #
+# copyright (C) 2026 William Breaden Madden                                    #
+#                                                                              #
+# This software is released under the terms of the GNU General Public License  #
+# version 3 (GPLv3).                                                           #
+#                                                                              #
+# This program is free software: you can redistribute it and/or modify it      #
+# under the terms of the GNU General Public License as published by the Free   #
+# Software Foundation, either version 3 of the License, or (at your option)    #
+# any later version.                                                           #
+#                                                                              #
+# This program is distributed in the hope that it will be useful, but WITHOUT  #
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or        #
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for     #
+# more details.                                                                #
+#                                                                              #
+# For a copy of the GNU General Public License, see                            #
+# <http://www.gnu.org/licenses>.                                               #
+#                                                                              #
+################################################################################
+"""
+
+from bisect import bisect_right
+from datetime import datetime, timezone
+import pathlib
+import re
+import sys
+import unicodedata
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("Pango", "1.0")
+
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+
+__VERSION__ = "2026-05-24T2221Z"
+
+
+APP_ID                    = "BrasaPlayer"
+SEEK_SHORT_US             = 5 * 1_000_000
+SEEK_VERY_SHORT_US        = 3 * 1_000_000
+SEEK_MEDIUM_US            = 60 * 1_000_000
+UPDATE_INTERVAL_MS        = 250
+FULLSCREEN_CURSOR_HIDE_MS = 3000
+SUBTITLE_EXTENSIONS       = (".srt", ".vtt")
+SHORTCUT_HELP_TEXT        = "\n".join(
+    (
+        "Space: play/pause",
+        "Left/Right: seek 5 seconds",
+        "Shift+Left/Right: seek 3 seconds",
+        "Ctrl+Left/Right: seek 1 minute",
+        "V: subtitles on/off",
+        "Shift+V: next subtitle file",
+        "S: save screenshot",
+        "F or F11: fullscreen",
+        "Esc: quit",
+    )
+)
+
+def collect_startup_issues():
+    issues = []
+
+    if Gdk.Display.get_default() is None:
+        issues.append(
+            "No graphical display is available. Start the player inside a GNOME or Wayland session."
+        )
+
+    if not hasattr(Gtk, "Video") or not hasattr(Gtk, "MediaFile"):
+        issues.append("GTK 4 media widgets are not available in this PyGObject installation.")
+
+    return issues
+
+
+def print_startup_diagnostics(issues):
+    gtk_major = Gtk.get_major_version()
+    gtk_minor = Gtk.get_minor_version()
+    gtk_micro = Gtk.get_micro_version()
+
+    print("Startup dependency check failed.", file=sys.stderr)
+    print(f"GTK version: {gtk_major}.{gtk_minor}.{gtk_micro}", file=sys.stderr)
+    for issue in issues:
+        print(f"- {issue}", file=sys.stderr)
+    print(
+        "Install GTK 4, PyGObject, and the GTK media backend package for your distribution "
+        "(on Ubuntu 24.04 this is typically 'libgtk-4-media-gstreamer').",
+        file=sys.stderr,
+    )
+
+
+class VideoPlayerWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="BrasaPlayer")
+        self.set_default_size(960, 640)
+
+        self.playlist = []
+        self.current_index = -1
+        self.repeat_current = True
+        self.is_playing = False
+        self.is_fullscreen_mode = False
+        self.duration_us = -1
+        self.position_us = 0
+        self.media_stream = None
+        self.volume = 1.0
+        self.updating_progress = False
+        self.subtitles_enabled = False
+        self.subtitle_entries = []
+        self.subtitle_starts = []
+        self.subtitle_tracks = []
+        self.subtitle_track_index = -1
+        self.status_message_timeout = 0
+        self.cursor_hide_timeout = 0
+        self.cursor_hidden = False
+        self.hidden_cursor = self.build_hidden_cursor()
+        self.inhibit_cookie = 0
+
+        self.header_bar = Gtk.HeaderBar()
+        self.title_label = Gtk.Label(label="BrasaPlayer")
+        self.header_bar.set_title_widget(self.title_label)
+        self.set_titlebar(self.header_bar)
+
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_child(self.main_box)
+
+        self.video_overlay = Gtk.Overlay()
+        self.video_overlay.set_hexpand(True)
+        self.video_overlay.set_vexpand(True)
+        self.main_box.append(self.video_overlay)
+
+        self.video_box = Gtk.Box()
+        self.video_box.set_hexpand(True)
+        self.video_box.set_vexpand(True)
+        self.video_box.add_css_class("black-background")
+        self.video_overlay.set_child(self.video_box)
+
+        self.video_widget = Gtk.Picture()
+        self.video_widget.set_hexpand(True)
+        self.video_widget.set_vexpand(True)
+        self.video_widget.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.video_box.append(self.video_widget)
+
+        self.placeholder_label = Gtk.Label(label="Open video files to begin playback")
+        self.placeholder_label.add_css_class("dim-label")
+        self.placeholder_label.set_halign(Gtk.Align.CENTER)
+        self.placeholder_label.set_valign(Gtk.Align.CENTER)
+        self.video_overlay.add_overlay(self.placeholder_label)
+
+        self.subtitle_label = Gtk.Label()
+        self.subtitle_label.set_wrap(True)
+        self.subtitle_label.set_justify(Gtk.Justification.CENTER)
+        self.subtitle_label.set_halign(Gtk.Align.CENTER)
+        self.subtitle_label.set_valign(Gtk.Align.END)
+        self.subtitle_label.set_margin_start(48)
+        self.subtitle_label.set_margin_end(48)
+        self.subtitle_label.set_margin_bottom(28)
+        self.subtitle_label.add_css_class("subtitle-overlay")
+        self.subtitle_label.set_visible(False)
+        self.video_overlay.add_overlay(self.subtitle_label)
+
+        self.status_label = Gtk.Label()
+        self.status_label.set_wrap(True)
+        self.status_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.status_label.set_justify(Gtk.Justification.LEFT)
+        self.status_label.set_xalign(0.0)
+        self.status_label.set_max_width_chars(40)
+        self.status_label.set_halign(Gtk.Align.CENTER)
+        self.status_label.set_valign(Gtk.Align.START)
+        self.status_label.set_margin_top(20)
+        self.status_label.set_margin_start(32)
+        self.status_label.set_margin_end(32)
+        self.status_label.add_css_class("status-overlay")
+        self.status_label.set_visible(False)
+        self.video_overlay.add_overlay(self.status_label)
+
+        self.controls_revealer = Gtk.Revealer()
+        self.controls_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+        self.controls_revealer.set_reveal_child(True)
+        self.main_box.append(self.controls_revealer)
+
+        self.controls_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=8,
+            margin_start=12,
+            margin_end=12,
+            margin_top=8,
+            margin_bottom=10,
+        )
+        self.controls_box.add_css_class("toolbar")
+        self.controls_revealer.set_child(self.controls_box)
+
+        self.progress_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL,
+            0.0,
+            100.0,
+            1.0,
+        )
+        self.progress_scale.set_draw_value(False)
+        self.progress_scale.set_sensitive(False)
+        self.progress_scale.set_hexpand(True)
+        self.progress_scale.connect("value-changed", self.on_progress_value_changed)
+        self.controls_box.append(self.progress_scale)
+
+        transport_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.controls_box.append(transport_box)
+
+        self.previous_button = Gtk.Button(icon_name="media-skip-backward-symbolic")
+        self.previous_button.set_tooltip_text("Previous")
+        self.previous_button.connect("clicked", self.on_previous_clicked)
+        transport_box.append(self.previous_button)
+
+        self.play_button = Gtk.Button(icon_name="media-playback-start-symbolic")
+        self.play_button.set_tooltip_text("Play/Pause")
+        self.play_button.connect("clicked", self.on_play_pause_clicked)
+        transport_box.append(self.play_button)
+
+        self.next_button = Gtk.Button(icon_name="media-skip-forward-symbolic")
+        self.next_button.set_tooltip_text("Next")
+        self.next_button.connect("clicked", self.on_next_clicked)
+        transport_box.append(self.next_button)
+
+        self.time_label = Gtk.Label(label="00:00 / 00:00")
+        self.time_label.set_hexpand(True)
+        self.time_label.set_xalign(0.0)
+        transport_box.append(self.time_label)
+
+        self.repeat_button = Gtk.ToggleButton(label="Loop")
+        self.repeat_button.set_active(True)
+        self.repeat_button.set_tooltip_text("Repeat current video")
+        self.repeat_button.connect("toggled", self.on_repeat_toggled)
+        transport_box.append(self.repeat_button)
+
+        self.volume_button = Gtk.VolumeButton()
+        self.volume_button.set_value(1.0)
+        self.volume_button.connect("value-changed", self.on_volume_changed)
+        transport_box.append(self.volume_button)
+
+        self.install_actions()
+        self.install_controllers()
+        self.install_css()
+
+        self.tick_id = GLib.timeout_add(UPDATE_INTERVAL_MS, self.update_position)
+
+        self.connect("close-request", self.on_close_request)
+        self.connect("notify::fullscreened", self.on_fullscreen_changed)
+
+    def install_actions(self):
+        entries = [
+            ("play-pause", self.on_play_pause_action),
+            ("previous", self.on_previous_action),
+            ("next", self.on_next_action),
+            ("seek-backward-short", self.on_seek_backward_short_action),
+            ("seek-forward-short", self.on_seek_forward_short_action),
+            ("seek-backward-very-short", self.on_seek_backward_very_short_action),
+            ("seek-forward-very-short", self.on_seek_forward_very_short_action),
+            ("seek-backward-medium", self.on_seek_backward_medium_action),
+            ("seek-forward-medium", self.on_seek_forward_medium_action),
+            ("show-shortcuts", self.on_show_shortcuts_action),
+            ("toggle-fullscreen", self.on_toggle_fullscreen_action),
+            ("toggle-subtitles", self.on_toggle_subtitles_action),
+            ("cycle-subtitles", self.on_cycle_subtitles_action),
+            ("close-window", self.on_close_window_action),
+            ("capture-screenshot", self.on_capture_screenshot_action),
+        ]
+        for name, callback in entries:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            self.add_action(action)
+
+    def install_controllers(self):
+        controller = Gtk.ShortcutController()
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("space"),
+                Gtk.NamedAction.new("win.play-pause"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("Left"),
+                Gtk.NamedAction.new("win.seek-backward-short"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("Right"),
+                Gtk.NamedAction.new("win.seek-forward-short"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Shift>Left"),
+                Gtk.NamedAction.new("win.seek-backward-very-short"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Shift>Right"),
+                Gtk.NamedAction.new("win.seek-forward-very-short"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Control>Left"),
+                Gtk.NamedAction.new("win.seek-backward-medium"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Control>Right"),
+                Gtk.NamedAction.new("win.seek-forward-medium"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("h"),
+                Gtk.NamedAction.new("win.show-shortcuts"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("F11"),
+                Gtk.NamedAction.new("win.toggle-fullscreen"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("f"),
+                Gtk.NamedAction.new("win.toggle-fullscreen"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("v"),
+                Gtk.NamedAction.new("win.toggle-subtitles"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Shift>v"),
+                Gtk.NamedAction.new("win.cycle-subtitles"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("Escape"),
+                Gtk.NamedAction.new("win.close-window"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("s"),
+                Gtk.NamedAction.new("win.capture-screenshot"),
+            )
+        )
+        self.add_controller(controller)
+
+        motion_controller = Gtk.EventControllerMotion()
+        motion_controller.connect("motion", self.on_motion)
+        self.video_overlay.add_controller(motion_controller)
+
+        click_controller = Gtk.GestureClick()
+        click_controller.set_button(Gdk.BUTTON_PRIMARY)
+        click_controller.connect("pressed", self.on_video_pressed)
+        self.video_overlay.add_controller(click_controller)
+
+    def install_css(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b"""
+            .black-background {
+                background: #000;
+            }
+
+            .toolbar {
+                background: alpha(#1f1f1f, 0.92);
+                color: #f6f5f4;
+            }
+
+            .subtitle-overlay {
+                background: alpha(#000, 0.55);
+                color: white;
+                font-size: 24px;
+                font-weight: 700;
+                padding: 10px 16px;
+                border-radius: 12px;
+            }
+
+            .status-overlay {
+                background: alpha(#111, 0.72);
+                color: white;
+                font-size: 16px;
+                font-weight: 700;
+                padding: 10px 16px;
+                border-radius: 16px;
+            }
+            """
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    def on_close_request(self, *_args):
+        if self.tick_id:
+            GLib.source_remove(self.tick_id)
+            self.tick_id = 0
+        if self.status_message_timeout:
+            GLib.source_remove(self.status_message_timeout)
+            self.status_message_timeout = 0
+        if self.cursor_hide_timeout:
+            GLib.source_remove(self.cursor_hide_timeout)
+            self.cursor_hide_timeout = 0
+        self.sync_session_inhibit(force_release=True)
+        self.disconnect_media_stream()
+        return False
+
+    def on_motion(self, *_args):
+        if not self.is_fullscreen_mode:
+            return
+        self.show_mouse_cursor()
+        self.schedule_cursor_hide()
+
+    def on_video_pressed(self, _gesture, n_press, _x, _y):
+        if n_press == 2:
+            self.on_toggle_fullscreen_action()
+
+    def on_fullscreen_changed(self, *_args):
+        self.is_fullscreen_mode = self.props.fullscreened
+        self.header_bar.set_visible(not self.is_fullscreen_mode)
+        self.controls_revealer.set_reveal_child(not self.is_fullscreen_mode)
+        if self.cursor_hide_timeout:
+            GLib.source_remove(self.cursor_hide_timeout)
+            self.cursor_hide_timeout = 0
+        self.show_mouse_cursor()
+        if self.is_fullscreen_mode:
+            self.schedule_cursor_hide()
+
+    def on_repeat_toggled(self, button):
+        self.repeat_current = button.get_active()
+        button.set_label("Loop" if self.repeat_current else "List")
+        button.set_tooltip_text(
+            "Repeat current video" if self.repeat_current else "Play videos in order"
+        )
+        if self.media_stream is not None:
+            self.media_stream.set_loop(self.repeat_current)
+        self.update_navigation_buttons()
+
+    def on_volume_changed(self, _button, value):
+        self.volume = value
+        if self.media_stream is not None:
+            self.media_stream.set_volume(value)
+
+    def on_play_pause_clicked(self, _button):
+        self.toggle_play_pause()
+
+    def on_previous_clicked(self, _button):
+        self.play_previous()
+
+    def on_next_clicked(self, _button):
+        self.play_next()
+
+    def on_play_pause_action(self, *_args):
+        self.toggle_play_pause()
+
+    def on_previous_action(self, *_args):
+        self.play_previous()
+
+    def on_next_action(self, *_args):
+        self.play_next()
+
+    def on_seek_backward_short_action(self, *_args):
+        self.seek_relative(-SEEK_SHORT_US)
+
+    def on_seek_forward_short_action(self, *_args):
+        self.seek_relative(SEEK_SHORT_US)
+
+    def on_seek_backward_very_short_action(self, *_args):
+        self.seek_relative(-SEEK_VERY_SHORT_US)
+
+    def on_seek_forward_very_short_action(self, *_args):
+        self.seek_relative(SEEK_VERY_SHORT_US)
+
+    def on_seek_backward_medium_action(self, *_args):
+        self.seek_relative(-SEEK_MEDIUM_US)
+
+    def on_seek_forward_medium_action(self, *_args):
+        self.seek_relative(SEEK_MEDIUM_US)
+
+    def on_show_shortcuts_action(self, *_args):
+        self.show_status_message(SHORTCUT_HELP_TEXT, timeout_ms=5000)
+
+    def on_toggle_fullscreen_action(self, *_args):
+        if self.is_fullscreen_mode:
+            self.unfullscreen()
+        else:
+            self.fullscreen()
+
+    def on_toggle_subtitles_action(self, *_args):
+        if not self.subtitle_tracks:
+            self.subtitles_enabled = False
+            self.show_status_message("No external subtitles found")
+            self.update_subtitle_label()
+            return
+        self.subtitles_enabled = not self.subtitles_enabled
+        if self.subtitles_enabled and self.subtitle_track_index < 0:
+            self.set_active_subtitle_track(0)
+        self.show_status_message(
+            f"Subtitles on: {self.subtitle_tracks[self.subtitle_track_index]['name']}"
+            if self.subtitles_enabled and self.subtitle_track_index >= 0
+            else "Subtitles off"
+        )
+        self.update_subtitle_label()
+
+    def on_cycle_subtitles_action(self, *_args):
+        if not self.subtitle_tracks:
+            self.show_status_message("No external subtitles found")
+            return
+        next_index = 0 if self.subtitle_track_index < 0 else (
+            (self.subtitle_track_index + 1) % len(self.subtitle_tracks)
+        )
+        self.set_active_subtitle_track(next_index)
+        self.subtitles_enabled = True
+        self.show_status_message(f"Subtitles: {self.subtitle_tracks[next_index]['name']}")
+        self.update_subtitle_label()
+
+    def on_close_window_action(self, *_args):
+        self.close()
+
+    def on_capture_screenshot_action(self, *_args):
+        if self.media_stream is None or not (0 <= self.current_index < len(self.playlist)):
+            self.show_status_message("No video frame available")
+            return
+
+        width = self.video_widget.get_width()
+        height = self.video_widget.get_height()
+        if width <= 0 or height <= 0:
+            self.show_status_message("Video frame is not ready")
+            return
+
+        snapshot = Gtk.Snapshot()
+        self.media_stream.snapshot(snapshot, float(width), float(height))
+        node = snapshot.to_node()
+        if node is None:
+            self.show_status_message("Could not capture frame")
+            return
+
+        native = self.get_native()
+        if native is None:
+            self.show_status_message("Could not access renderer")
+            return
+
+        renderer = native.get_renderer()
+        if renderer is None:
+            self.show_status_message("Could not access renderer")
+            return
+
+        try:
+            texture = renderer.render_texture(node, None)
+        except Exception as exc:
+            self.show_status_message("Could not render frame")
+            print(f"Screenshot render error: {exc}", file=sys.stderr)
+            return
+
+        if texture is None:
+            self.show_status_message("Could not render frame")
+            return
+
+        output_path = self.build_screenshot_path(self.playlist[self.current_index])
+        try:
+            texture.save_to_png(str(output_path))
+        except Exception as exc:
+            self.show_status_message("Could not save screenshot")
+            print(f"Screenshot save error: {exc}", file=sys.stderr)
+            return
+        self.show_status_message(f"Saved screenshot: {output_path.name}", timeout_ms=2200)
+
+    def sync_session_inhibit(self, force_release=False):
+        app = self.get_application()
+        if app is None:
+            return
+
+        should_inhibit = (
+            not force_release
+            and self.is_playing
+            and self.media_stream is not None
+        )
+
+        if should_inhibit and not self.inhibit_cookie:
+            self.inhibit_cookie = app.inhibit(
+                self,
+                Gtk.ApplicationInhibitFlags.IDLE | Gtk.ApplicationInhibitFlags.SUSPEND,
+                "Video playback in progress",
+            )
+        elif not should_inhibit and self.inhibit_cookie:
+            app.uninhibit(self.inhibit_cookie)
+            self.inhibit_cookie = 0
+
+    def build_hidden_cursor(self):
+        try:
+            texture = Gdk.MemoryTexture.new(
+                1,
+                1,
+                Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                GLib.Bytes.new(bytes((0, 0, 0, 0))),
+                4,
+            )
+            return Gdk.Cursor.new_from_texture(texture, 0, 0, None)
+        except Exception:
+            return None
+
+    def schedule_cursor_hide(self):
+        if self.cursor_hide_timeout:
+            GLib.source_remove(self.cursor_hide_timeout)
+        self.cursor_hide_timeout = GLib.timeout_add(
+            FULLSCREEN_CURSOR_HIDE_MS,
+            self.hide_mouse_cursor,
+        )
+
+    def hide_mouse_cursor(self):
+        self.cursor_hide_timeout = 0
+        if not self.is_fullscreen_mode:
+            return GLib.SOURCE_REMOVE
+        if self.hidden_cursor is not None:
+            self.set_cursor(self.hidden_cursor)
+        else:
+            self.set_cursor_from_name("none")
+        self.cursor_hidden = True
+        return GLib.SOURCE_REMOVE
+
+    def show_mouse_cursor(self):
+        if self.cursor_hidden:
+            self.set_cursor(None)
+            self.cursor_hidden = False
+
+    def open_files(self, files):
+        new_paths = []
+        for file_obj in files:
+            path = file_obj.get_path()
+            if path:
+                new_paths.append(pathlib.Path(path).resolve())
+
+        if not new_paths:
+            return
+
+        self.playlist = new_paths
+        self.current_index = 0
+        self.play_current()
+        self.present()
+
+    def disconnect_media_stream(self):
+        if self.media_stream is None:
+            return
+        self.media_stream.disconnect_by_func(self.on_stream_ended_changed)
+        self.media_stream.disconnect_by_func(self.on_stream_error_changed)
+        self.media_stream.disconnect_by_func(self.on_stream_prepared_changed)
+        self.media_stream.pause()
+        self.media_stream = None
+        self.video_widget.set_paintable(None)
+        self.sync_session_inhibit()
+
+    def play_current(self):
+        if not (0 <= self.current_index < len(self.playlist)):
+            return
+
+        current_path = self.playlist[self.current_index]
+        self.title_label.set_label(current_path.name)
+        self.placeholder_label.set_visible(False)
+        self.load_subtitles_for_video(current_path)
+        self.disconnect_media_stream()
+
+        self.media_stream = Gtk.MediaFile.new_for_filename(str(current_path))
+        self.media_stream.set_loop(self.repeat_current)
+        self.media_stream.set_volume(self.volume)
+        self.media_stream.connect("notify::ended", self.on_stream_ended_changed)
+        self.media_stream.connect("notify::error", self.on_stream_error_changed)
+        self.media_stream.connect("notify::prepared", self.on_stream_prepared_changed)
+        self.video_widget.set_paintable(self.media_stream)
+        self.media_stream.play()
+
+        self.is_playing = True
+        self.update_play_button()
+        self.update_navigation_buttons()
+        self.reset_progress()
+        self.sync_session_inhibit()
+
+    def play_previous(self):
+        if not self.playlist:
+            return
+        if self.current_index > 0:
+            self.current_index -= 1
+        else:
+            self.current_index = 0
+        self.play_current()
+
+    def play_next(self):
+        if not self.playlist:
+            return
+        if self.current_index + 1 < len(self.playlist):
+            self.current_index += 1
+            self.play_current()
+        elif self.repeat_current:
+            self.restart_current()
+
+    def restart_current(self):
+        if self.media_stream is None:
+            return
+        self.media_stream.seek(0)
+        self.media_stream.play()
+        self.is_playing = True
+        self.update_play_button()
+        self.sync_session_inhibit()
+
+    def toggle_play_pause(self):
+        if self.media_stream is None:
+            return
+        if self.is_playing:
+            self.media_stream.pause()
+        else:
+            self.media_stream.play()
+        self.is_playing = not self.is_playing
+        self.update_play_button()
+        self.sync_session_inhibit()
+
+    def seek_relative(self, delta_us):
+        if self.media_stream is None or not self.media_stream.is_seekable():
+            return
+        new_position = max(0, self.position_us + delta_us)
+        if self.duration_us > 0:
+            new_position = min(new_position, self.duration_us)
+        self.media_stream.seek(new_position)
+
+    def on_progress_value_changed(self, scale):
+        if self.updating_progress or self.media_stream is None:
+            return
+        if not self.media_stream.is_seekable() or self.duration_us <= 0:
+            return
+        self.media_stream.seek(int(scale.get_value()))
+
+    def update_play_button(self):
+        icon = (
+            "media-playback-pause-symbolic"
+            if self.is_playing
+            else "media-playback-start-symbolic"
+        )
+        self.play_button.set_icon_name(icon)
+
+    def update_navigation_buttons(self):
+        has_playlist = bool(self.playlist)
+        self.previous_button.set_sensitive(has_playlist and self.current_index > 0)
+        self.next_button.set_sensitive(
+            has_playlist
+            and (self.current_index + 1 < len(self.playlist) or self.repeat_current)
+        )
+
+    def reset_progress(self):
+        self.duration_us = -1
+        self.position_us = 0
+        self.progress_scale.set_range(0.0, 1.0)
+        self.updating_progress = True
+        self.progress_scale.set_value(0.0)
+        self.updating_progress = False
+        self.progress_scale.set_sensitive(False)
+        self.time_label.set_label("00:00 / 00:00")
+        self.update_subtitle_label()
+
+    def update_position(self):
+        if self.media_stream is None:
+            return GLib.SOURCE_CONTINUE
+
+        self.duration_us = self.media_stream.get_duration()
+        self.position_us = self.media_stream.get_timestamp()
+
+        if self.duration_us > 0:
+            self.progress_scale.set_range(0.0, float(self.duration_us))
+            self.updating_progress = True
+            self.progress_scale.set_value(min(max(self.position_us, 0), self.duration_us))
+            self.updating_progress = False
+            self.progress_scale.set_sensitive(self.media_stream.is_seekable())
+        else:
+            self.progress_scale.set_sensitive(False)
+
+        self.time_label.set_label(
+            f"{self.format_us(self.position_us)} / {self.format_us(self.duration_us)}"
+        )
+        self.update_subtitle_label()
+        return GLib.SOURCE_CONTINUE
+
+    def format_us(self, value):
+        if value is None or value < 0:
+            return "00:00"
+        total_seconds = int(value // 1_000_000)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def on_stream_ended_changed(self, media_stream, _param_spec):
+        if media_stream is not self.media_stream or not media_stream.props.ended:
+            return
+        if self.repeat_current:
+            self.restart_current()
+        elif self.current_index + 1 < len(self.playlist):
+            self.current_index += 1
+            self.play_current()
+        else:
+            self.is_playing = False
+            self.update_play_button()
+            self.sync_session_inhibit()
+
+    def on_stream_error_changed(self, media_stream, _param_spec):
+        if media_stream is not self.media_stream:
+            return
+        error = media_stream.props.error
+        if error is None:
+            return
+        self.disconnect_media_stream()
+        self.is_playing = False
+        self.update_play_button()
+        self.placeholder_label.set_visible(True)
+        self.title_label.set_label("Playback Error")
+        self.time_label.set_label(error.message)
+        print(f"Playback error: {error.message}", file=sys.stderr)
+
+    def on_stream_prepared_changed(self, media_stream, _param_spec):
+        if media_stream is not self.media_stream or not media_stream.props.prepared:
+            return
+        media_stream.set_loop(self.repeat_current)
+        media_stream.set_volume(self.volume)
+        self.sync_session_inhibit()
+
+    def update_subtitle_label(self):
+        if not self.subtitles_enabled or not self.subtitle_entries or self.position_us < 0:
+            self.subtitle_label.set_visible(False)
+            self.subtitle_label.set_label("")
+            return
+
+        text = ""
+        index = bisect_right(self.subtitle_starts, self.position_us) - 1
+        if index >= 0:
+            start_us, end_us, cue_text = self.subtitle_entries[index]
+            if start_us <= self.position_us <= end_us:
+                text = cue_text
+
+        self.subtitle_label.set_label(text)
+        self.subtitle_label.set_visible(bool(text))
+
+    def load_subtitles_for_video(self, video_path):
+        self.subtitle_entries = []
+        self.subtitle_starts = []
+        self.subtitle_tracks = []
+        self.subtitle_track_index = -1
+        self.subtitle_label.set_visible(False)
+        self.subtitle_label.set_label("")
+        seen_paths = set()
+
+        for subtitle_path in self.find_subtitle_candidates(video_path):
+            resolved = subtitle_path.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            entries = self.read_subtitle_entries(subtitle_path)
+            if entries:
+                self.subtitle_tracks.append(
+                    {
+                        "name": subtitle_path.name,
+                        "entries": entries,
+                        "starts": [entry[0] for entry in entries],
+                    }
+                )
+
+        if self.subtitle_tracks:
+            self.set_active_subtitle_track(0)
+        else:
+            self.subtitle_entries = []
+
+    def find_subtitle_candidates(self, video_path):
+        candidates = []
+        for suffix in SUBTITLE_EXTENSIONS:
+            exact_match = video_path.with_suffix(suffix)
+            if exact_match.exists():
+                candidates.append(exact_match)
+
+            pattern = f"{video_path.stem}.*{suffix}"
+            for path in sorted(video_path.parent.glob(pattern)):
+                candidates.append(path)
+        return candidates
+
+    def read_subtitle_entries(self, subtitle_path):
+        try:
+            content = subtitle_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = subtitle_path.read_text(encoding="latin-1")
+
+        if subtitle_path.suffix.lower() == ".srt":
+            return self.parse_srt_subtitles(content)
+        return self.parse_vtt_subtitles(content)
+
+    def set_active_subtitle_track(self, index):
+        if not (0 <= index < len(self.subtitle_tracks)):
+            self.subtitle_track_index = -1
+            self.subtitle_entries = []
+            self.subtitle_starts = []
+            return
+        self.subtitle_track_index = index
+        self.subtitle_entries = self.subtitle_tracks[index]["entries"]
+        self.subtitle_starts = self.subtitle_tracks[index]["starts"]
+
+    def show_status_message(self, text, timeout_ms=1400):
+        if self.status_message_timeout:
+            GLib.source_remove(self.status_message_timeout)
+            self.status_message_timeout = 0
+        self.status_label.set_label(text)
+        self.status_label.set_visible(True)
+        self.status_message_timeout = GLib.timeout_add(timeout_ms, self.hide_status_message)
+
+    def hide_status_message(self):
+        self.status_message_timeout = 0
+        self.status_label.set_visible(False)
+        self.status_label.set_label("")
+        return GLib.SOURCE_REMOVE
+
+    def parse_srt_subtitles(self, content):
+        entries = []
+        blocks = re.split(r"\n\s*\n", content.strip())
+        for block in blocks:
+            lines = [line.strip("\ufeff") for line in block.splitlines() if line.strip()]
+            if len(lines) < 2:
+                continue
+            time_line = lines[1] if "-->" in lines[1] else lines[0]
+            if "-->" not in time_line:
+                continue
+            start_text, end_text = [part.strip() for part in time_line.split("-->", 1)]
+            start_us = self.parse_timestamp_to_us(start_text)
+            end_us = self.parse_timestamp_to_us(end_text)
+            if start_us is None or end_us is None:
+                continue
+            text_lines = lines[2:] if time_line == lines[1] else lines[1:]
+            entries.append((start_us, end_us, "\n".join(text_lines)))
+        return entries
+
+    def parse_vtt_subtitles(self, content):
+        entries = []
+        blocks = re.split(r"\n\s*\n", content.strip())
+        for block in blocks:
+            lines = [line.strip("\ufeff") for line in block.splitlines() if line.strip()]
+            if not lines or lines[0] == "WEBVTT":
+                continue
+            time_index = 1 if len(lines) > 1 and "-->" not in lines[0] else 0
+            if time_index >= len(lines) or "-->" not in lines[time_index]:
+                continue
+            start_text, end_text = [part.strip() for part in lines[time_index].split("-->", 1)]
+            start_us = self.parse_timestamp_to_us(start_text)
+            end_us = self.parse_timestamp_to_us(end_text)
+            if start_us is None or end_us is None:
+                continue
+            text_lines = lines[time_index + 1 :]
+            entries.append((start_us, end_us, "\n".join(text_lines)))
+        return entries
+
+    def parse_timestamp_to_us(self, value):
+        match = re.match(r"(?:(\d+):)?(\d{2}):(\d{2})[,.](\d{3})", value)
+        if not match:
+            return None
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2))
+        seconds = int(match.group(3))
+        milliseconds = int(match.group(4))
+        return (((hours * 60) + minutes) * 60 + seconds) * 1_000_000 + milliseconds * 1000
+
+    def build_screenshot_path(self, video_path):
+        utc_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%MZ")
+        video_slug = self.slugify_filename_component(video_path.name)
+        position_slug = self.video_position_slug(self.position_us)
+        base_name = f"{utc_prefix}_{video_slug}_{position_slug}.png"
+        candidate = video_path.parent / base_name
+
+        counter = 2
+        while candidate.exists():
+            candidate = video_path.parent / f"{utc_prefix}_{video_slug}_{position_slug}_{counter}.png"
+            counter += 1
+
+        return candidate
+
+    def slugify_filename_component(self, value):
+        normalized = unicodedata.normalize("NFKD", value)
+        ascii_value = normalized.encode("ascii", "ignore").decode("ascii").lower()
+        ascii_value = re.sub(r"[^a-z0-9]+", "-", ascii_value)
+        ascii_value = ascii_value.strip("-")
+        return ascii_value or "video"
+
+    def video_position_slug(self, position_us):
+        if position_us is None or position_us < 0:
+            return "00h00m00s000ms"
+        total_milliseconds = int(position_us // 1000)
+        total_seconds, milliseconds = divmod(total_milliseconds, 1000)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}h{minutes:02d}m{seconds:02d}s{milliseconds:03d}ms"
+
+
+class VideoPlayerApplication(Gtk.Application):
+    def __init__(self):
+        super().__init__(
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.HANDLES_OPEN,
+        )
+
+    def do_activate(self):
+        window = self.get_active_window()
+        if window is None:
+            window = VideoPlayerWindow(self)
+        window.present()
+
+    def do_open(self, files, _n_files, _hint):
+        window = self.get_active_window()
+        if window is None:
+            window = VideoPlayerWindow(self)
+        window.open_files(files)
+
+
+def main():
+    issues = collect_startup_issues()
+    if issues:
+        print_startup_diagnostics(issues)
+        return 1
+    app = VideoPlayerApplication()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
