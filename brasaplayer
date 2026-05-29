@@ -49,10 +49,11 @@ gi.require_version("Pango", "1.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 
-__VERSION__ = "2026-05-24T2221Z"
+__VERSION__ = "2026-05-26T2034Z"
 
 
-APP_ID                    = "BrasaPlayer"
+APP_ID                    = "io.github.wdbm.brasaplayer"
+ICON_NAME                 = "brasaplayer"
 SEEK_SHORT_US             = 5 * 1_000_000
 SEEK_VERY_SHORT_US        = 3 * 1_000_000
 SEEK_MEDIUM_US            = 60 * 1_000_000
@@ -62,9 +63,12 @@ SUBTITLE_EXTENSIONS       = (".srt", ".vtt")
 SHORTCUT_HELP_TEXT        = "\n".join(
     (
         "Space: play/pause",
+        "A: previous video",
+        "Z: next video",
         "Left/Right: seek 5 seconds",
         "Shift+Left/Right: seek 3 seconds",
         "Ctrl+Left/Right: seek 1 minute",
+        "Tab: fullscreen controls on/off",
         "V: subtitles on/off",
         "Shift+V: next subtitle file",
         "S: save screenshot",
@@ -106,6 +110,7 @@ def print_startup_diagnostics(issues):
 class VideoPlayerWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="BrasaPlayer")
+        self.set_icon_name(ICON_NAME)
         self.set_default_size(960, 640)
 
         self.playlist = []
@@ -113,6 +118,7 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
         self.repeat_current = True
         self.is_playing = False
         self.is_fullscreen_mode = False
+        self.fullscreen_controls_visible = False
         self.duration_us = -1
         self.position_us = 0
         self.media_stream = None
@@ -271,6 +277,7 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
             ("seek-forward-medium", self.on_seek_forward_medium_action),
             ("show-shortcuts", self.on_show_shortcuts_action),
             ("toggle-fullscreen", self.on_toggle_fullscreen_action),
+            ("toggle-fullscreen-controls", self.on_toggle_fullscreen_controls_action),
             ("toggle-subtitles", self.on_toggle_subtitles_action),
             ("cycle-subtitles", self.on_cycle_subtitles_action),
             ("close-window", self.on_close_window_action),
@@ -287,6 +294,18 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
             Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string("space"),
                 Gtk.NamedAction.new("win.play-pause"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("a"),
+                Gtk.NamedAction.new("win.previous"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("z"),
+                Gtk.NamedAction.new("win.next"),
             )
         )
         controller.add_shortcut(
@@ -341,6 +360,12 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
             Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string("f"),
                 Gtk.NamedAction.new("win.toggle-fullscreen"),
+            )
+        )
+        controller.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("Tab"),
+                Gtk.NamedAction.new("win.toggle-fullscreen-controls"),
             )
         )
         controller.add_shortcut(
@@ -434,6 +459,11 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
         if not self.is_fullscreen_mode:
             return
         self.show_mouse_cursor()
+        if self.fullscreen_controls_visible:
+            if self.cursor_hide_timeout:
+                GLib.source_remove(self.cursor_hide_timeout)
+                self.cursor_hide_timeout = 0
+            return
         self.schedule_cursor_hide()
 
     def on_video_pressed(self, _gesture, n_press, _x, _y):
@@ -442,8 +472,10 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
 
     def on_fullscreen_changed(self, *_args):
         self.is_fullscreen_mode = self.props.fullscreened
+        if self.is_fullscreen_mode:
+            self.fullscreen_controls_visible = False
         self.header_bar.set_visible(not self.is_fullscreen_mode)
-        self.controls_revealer.set_reveal_child(not self.is_fullscreen_mode)
+        self.update_controls_visibility()
         if self.cursor_hide_timeout:
             GLib.source_remove(self.cursor_hide_timeout)
             self.cursor_hide_timeout = 0
@@ -510,6 +542,25 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
             self.unfullscreen()
         else:
             self.fullscreen()
+
+    def on_toggle_fullscreen_controls_action(self, *_args):
+        if not self.is_fullscreen_mode:
+            return
+        self.fullscreen_controls_visible = not self.fullscreen_controls_visible
+        self.update_controls_visibility()
+        self.show_status_message(
+            "Fullscreen controls shown"
+            if self.fullscreen_controls_visible
+            else "Fullscreen controls hidden",
+            timeout_ms=1500,
+        )
+        self.show_mouse_cursor()
+        if self.fullscreen_controls_visible:
+            if self.cursor_hide_timeout:
+                GLib.source_remove(self.cursor_hide_timeout)
+                self.cursor_hide_timeout = 0
+        else:
+            self.schedule_cursor_hide()
 
     def on_toggle_subtitles_action(self, *_args):
         if not self.subtitle_tracks:
@@ -594,6 +645,7 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
         app = self.get_application()
         if app is None:
             return
+        application_id = app.get_application_id()
 
         should_inhibit = (
             not force_release
@@ -602,6 +654,8 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
         )
 
         if should_inhibit and not self.inhibit_cookie:
+            if not application_id:
+                return
             self.inhibit_cookie = app.inhibit(
                 self,
                 Gtk.ApplicationInhibitFlags.IDLE | Gtk.ApplicationInhibitFlags.SUSPEND,
@@ -634,7 +688,7 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
 
     def hide_mouse_cursor(self):
         self.cursor_hide_timeout = 0
-        if not self.is_fullscreen_mode:
+        if not self.is_fullscreen_mode or self.fullscreen_controls_visible:
             return GLib.SOURCE_REMOVE
         if self.hidden_cursor is not None:
             self.set_cursor(self.hidden_cursor)
@@ -647,6 +701,11 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
         if self.cursor_hidden:
             self.set_cursor(None)
             self.cursor_hidden = False
+
+    def update_controls_visibility(self):
+        self.controls_revealer.set_reveal_child(
+            (not self.is_fullscreen_mode) or self.fullscreen_controls_visible
+        )
 
     def open_files(self, files):
         new_paths = []
@@ -1017,6 +1076,7 @@ class VideoPlayerWindow(Gtk.ApplicationWindow):
 
 class VideoPlayerApplication(Gtk.Application):
     def __init__(self):
+        Gtk.Window.set_default_icon_name(ICON_NAME)
         super().__init__(
             application_id=APP_ID,
             flags=Gio.ApplicationFlags.HANDLES_OPEN,
